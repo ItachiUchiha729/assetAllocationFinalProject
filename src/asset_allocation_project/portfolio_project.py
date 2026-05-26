@@ -227,7 +227,7 @@ class CostParameters:
     spread_bps: float = 0.0
     borrow_bps_annual: float = 0.0
     impact_multiplier: float = 0.0
-    trading_days: int = 252
+    trading_days: int = 250
 
     @property
     def half_spread_rate(self) -> float:
@@ -563,11 +563,9 @@ class FactorModelOptimizer(FactorReturnAnalysis):
         """Return daily decimal volatility for market-impact scaling.
 
         Module 10 defines the square-root impact coefficient as
-        beta_1 * sigma_i / sqrt(ADV_i). The data set does not include stock
-        prices or dollar ADV, so CompositeVolume is used elsewhere as the
-        available volume proxy while TotalRisk supplies sigma_i. TotalRisk and
-        SpecRisk are stored as annualized percentages, so they are converted to
-        daily decimals here.
+        beta_1 * sigma_i / sqrt(dollar_ADV_i). TotalRisk and SpecRisk are
+        stored as annualized percentages, so they are converted to daily
+        decimals here.
         """
         column = "TotalRisk" if "TotalRisk" in frame.columns else "SpecRisk"
         values = frame[column].astype(float).to_numpy()
@@ -576,13 +574,14 @@ class FactorModelOptimizer(FactorReturnAnalysis):
         return np.maximum(values / np.sqrt(252.0), 1e-8)
 
     def impact_scale_vector(self, date: str, frame: pd.DataFrame) -> Optional[np.ndarray]:
-        """Return c_i = sigma_i / sqrt(volume_i) for square-root impact."""
-        if "CompositeVolume" not in self.data.frames[date].columns:
+        """Return c_i = sigma_i / sqrt(dollar_ADV_i) for square-root impact."""
+        if "IssuerMarketCap" not in self.data.frames[date].columns:
             return None
         full_frame = self.data.frames[date].reindex(frame.index)
-        volume = full_frame["CompositeVolume"].fillna(0.0).to_numpy(dtype=float)
+        market_cap = full_frame["IssuerMarketCap"].fillna(0.0).to_numpy(dtype=float)
+        dollar_adv = 0.01 * market_cap
         daily_volatility = self.daily_volatility_vector(full_frame)
-        return daily_volatility / np.sqrt(np.maximum(volume, 1.0))
+        return daily_volatility / np.sqrt(np.maximum(dollar_adv, 1.0))
 
     @staticmethod
     def matrix_square_root(matrix: np.ndarray) -> np.ndarray:
@@ -653,49 +652,64 @@ class FactorModelOptimizer(FactorReturnAnalysis):
             return pd.Series(values, index=frame.index, name=pd.to_datetime(date))
 
         cp = self._require_cvxpy()
-        holdings = cp.Variable(n_assets)
+        dollar_scale = 1_000_000.0
+        holdings_scaled = cp.Variable(n_assets)
         if initial_holdings is not None and not initial_holdings.empty:
-            holdings.value = initial_holdings.reindex(frame.index).fillna(0.0).to_numpy(dtype=float)
+            holdings_scaled.value = initial_holdings.reindex(frame.index).fillna(0.0).to_numpy(dtype=float) / dollar_scale
 
         objective = (
-            0.5 * kappa * cp.sum_squares(q @ holdings)
-            + 0.5 * kappa * cp.sum(cp.multiply(spec_var, cp.square(holdings)))
-            - alpha_vec @ holdings
+            0.5 * kappa * dollar_scale * cp.sum_squares(q @ holdings_scaled)
+            + 0.5 * kappa * dollar_scale * cp.sum(cp.multiply(spec_var, cp.square(holdings_scaled)))
+            - alpha_vec @ holdings_scaled
         )
 
         if costs.half_spread_rate > 0.0 or costs.impact_multiplier > 0.0:
             previous = np.zeros(n_assets)
             if previous_holdings is not None and not previous_holdings.empty:
-                previous = previous_holdings.reindex(frame.index).fillna(0.0).to_numpy(dtype=float)
-            trade = holdings - previous
+                previous = previous_holdings.reindex(frame.index).fillna(0.0).to_numpy(dtype=float) / dollar_scale
+            trade = holdings_scaled - previous
             objective += costs.half_spread_rate * cp.norm1(trade)
             if costs.impact_multiplier > 0.0:
                 impact_scale = self.impact_scale_vector(date, frame)
                 if impact_scale is not None:
                     objective += costs.impact_multiplier * cp.sum(
-                        cp.multiply(impact_scale, cp.power(cp.abs(trade), 1.5))
+                        cp.multiply(impact_scale * np.sqrt(dollar_scale), cp.power(cp.abs(trade), 1.5))
                     )
 
         if costs.daily_borrow_rate > 0.0:
-            objective += costs.daily_borrow_rate * cp.sum(cp.pos(-holdings))
+            objective += costs.daily_borrow_rate * cp.sum(cp.pos(-holdings_scaled))
 
         problem = cp.Problem(cp.Minimize(objective))
-        solve_kwargs = {"warm_start": True, "verbose": False}
-        if solver is not None:
-            solve_kwargs["solver"] = solver
+        base_solve_kwargs = {"warm_start": True, "verbose": False}
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Solution may be inaccurate.*")
-            problem.solve(**solve_kwargs)
+            solver_attempts = [solver] if solver is not None else [None, "CLARABEL", "SCS"]
+            last_error: Optional[Exception] = None
+            for solver_name in solver_attempts:
+                solve_kwargs = dict(base_solve_kwargs)
+                if solver_name is not None:
+                    solve_kwargs["solver"] = solver_name
+                if solver_name == "SCS":
+                    solve_kwargs.update({"eps": 1e-5, "max_iters": 20_000})
+                try:
+                    problem.solve(**solve_kwargs)
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                if problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE} and holdings_scaled.value is not None:
+                    break
         acceptable_statuses = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
         if problem.status not in acceptable_statuses:
+            detail = f", last_error={last_error}" if last_error is not None else ""
             raise RuntimeError(
                 f"cvxpy failed for {date}: status={problem.status}, "
-                f"solver={solver or 'default'}"
+                f"solver={solver or 'default/CLARABEL/SCS'}{detail}"
             )
-        if holdings.value is None:
+        if holdings_scaled.value is None:
             raise RuntimeError(f"cvxpy did not return a solution for {date}.")
 
-        return pd.Series(holdings.value, index=frame.index, name=pd.to_datetime(date))
+        values = np.asarray(holdings_scaled.value).ravel() * dollar_scale
+        return pd.Series(values, index=frame.index, name=pd.to_datetime(date))
 
     def exact_minimizer_one_date(
         self,

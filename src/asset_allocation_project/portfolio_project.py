@@ -133,7 +133,7 @@ class FactorModelData:
     frames: dict[str, pd.DataFrame]
     covariance: dict[str, pd.DataFrame] = field(default_factory=dict)
     model_dir: Path = DEFAULT_FACTOR_MODEL_DIR
-    years: range = range(2003, 2004)
+    years: range = range(2003, 2011)
 
     def __post_init__(self) -> None:
         """Validate date ordering and basic data availability."""
@@ -178,7 +178,7 @@ class FactorModelData:
     def load(
         cls,
         model_dir: Optional[Union[str, Path]] = None,
-        years: range = range(2003, 2004),
+        years: range = range(2003, 2011),
     ) -> "FactorModelData":
         """Load all pandas frame and covariance pickle files from disk."""
         install_pandas_pickle_compatibility()
@@ -210,10 +210,12 @@ class FactorModelData:
                     "pandas-frames.YYYY.pickle.bz2 and covariance.YYYY.pickle.bz2."
                 )
 
-            with bz2.open(frame_path, "rb") as handle:
-                frames.update(pickle.load(handle))
-            with bz2.open(covariance_path, "rb") as handle:
-                covariance.update(pickle.load(handle))
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                with bz2.open(frame_path, "rb") as handle:
+                    frames.update(pickle.load(handle))
+                with bz2.open(covariance_path, "rb") as handle:
+                    covariance.update(pickle.load(handle))
 
         return cls(frames=frames, covariance=covariance, model_dir=model_path, years=years)
 
@@ -557,6 +559,31 @@ class FactorModelOptimizer(FactorReturnAnalysis):
             values = values / 100.0
         return (values**2) / 252.0
 
+    def daily_volatility_vector(self, frame: pd.DataFrame) -> np.ndarray:
+        """Return daily decimal volatility for market-impact scaling.
+
+        Module 10 defines the square-root impact coefficient as
+        beta_1 * sigma_i / sqrt(ADV_i). The data set does not include stock
+        prices or dollar ADV, so CompositeVolume is used elsewhere as the
+        available volume proxy while TotalRisk supplies sigma_i. TotalRisk and
+        SpecRisk are stored as annualized percentages, so they are converted to
+        daily decimals here.
+        """
+        column = "TotalRisk" if "TotalRisk" in frame.columns else "SpecRisk"
+        values = frame[column].astype(float).to_numpy()
+        if np.nanmedian(np.abs(values)) > 1.0:
+            values = values / 100.0
+        return np.maximum(values / np.sqrt(252.0), 1e-8)
+
+    def impact_scale_vector(self, date: str, frame: pd.DataFrame) -> Optional[np.ndarray]:
+        """Return c_i = sigma_i / sqrt(volume_i) for square-root impact."""
+        if "CompositeVolume" not in self.data.frames[date].columns:
+            return None
+        full_frame = self.data.frames[date].reindex(frame.index)
+        volume = full_frame["CompositeVolume"].fillna(0.0).to_numpy(dtype=float)
+        daily_volatility = self.daily_volatility_vector(full_frame)
+        return daily_volatility / np.sqrt(np.maximum(volume, 1.0))
+
     @staticmethod
     def matrix_square_root(matrix: np.ndarray) -> np.ndarray:
         """Compute a symmetric square root for a positive semidefinite matrix."""
@@ -642,10 +669,12 @@ class FactorModelOptimizer(FactorReturnAnalysis):
                 previous = previous_holdings.reindex(frame.index).fillna(0.0).to_numpy(dtype=float)
             trade = holdings - previous
             objective += costs.half_spread_rate * cp.norm1(trade)
-            if costs.impact_multiplier > 0.0 and "CompositeVolume" in self.data.frames[date].columns:
-                volume = self.data.frames[date].reindex(frame.index)["CompositeVolume"].fillna(0.0).to_numpy(dtype=float)
-                scale = 1.0 / np.sqrt(np.maximum(volume, 1.0))
-                objective += costs.impact_multiplier * cp.sum(cp.multiply(scale, cp.power(cp.abs(trade), 1.5)))
+            if costs.impact_multiplier > 0.0:
+                impact_scale = self.impact_scale_vector(date, frame)
+                if impact_scale is not None:
+                    objective += costs.impact_multiplier * cp.sum(
+                        cp.multiply(impact_scale, cp.power(cp.abs(trade), 1.5))
+                    )
 
         if costs.daily_borrow_rate > 0.0:
             objective += costs.daily_borrow_rate * cp.sum(cp.pos(-holdings))
@@ -724,10 +753,13 @@ class FactorModelOptimizer(FactorReturnAnalysis):
         trade = holdings - previous
         total_cost = costs.half_spread_rate * float(np.abs(trade).sum())
 
-        if costs.impact_multiplier > 0.0 and "CompositeVolume" in self.data.frames[date].columns:
-            volume = self.data.frames[date].reindex(holdings.index)["CompositeVolume"].fillna(0.0).to_numpy(dtype=float)
-            scale = 1.0 / np.sqrt(np.maximum(volume, 1.0))
-            total_cost += costs.impact_multiplier * float(np.sum(scale * np.abs(trade.to_numpy(dtype=float)) ** 1.5))
+        if costs.impact_multiplier > 0.0:
+            frame = self.data.frames[date].reindex(holdings.index)
+            impact_scale = self.impact_scale_vector(date, frame)
+            if impact_scale is not None:
+                total_cost += costs.impact_multiplier * float(
+                    np.sum(impact_scale * np.abs(trade.to_numpy(dtype=float)) ** 1.5)
+                )
 
         if costs.daily_borrow_rate > 0.0:
             total_cost += costs.daily_borrow_rate * float(np.clip(-holdings.to_numpy(dtype=float), 0.0, None).sum())

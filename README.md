@@ -49,5 +49,5 @@ pip install -r requirements.txt
 ## Run
 
 Open `notebooks/portfolio_visualization.ipynb` and run cells top-to-bottom after
-the data files are available. During development, use `years=range(2003, 2004)`
-first; for the full assignment use `years=range(2003, 2011)`.
+the data files are available. The notebook and package defaults use the full
+assignment window, `years=range(2003, 2011)`.
